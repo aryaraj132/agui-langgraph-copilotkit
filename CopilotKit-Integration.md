@@ -1,19 +1,24 @@
 # CopilotKit Frontend Integration Guide
 
-This document explains how to build a CopilotKit-based AG-UI frontend that connects to this backend. It covers setup, configuration, and working with both the **chat agent** and the **segment generation agent**.
+This document explains how the CopilotKit frontend in `frontend/` connects to the AG-UI backend, and how to build your own. It covers setup, the Next.js API route bridge, and all CopilotKit patterns used.
 
-> **Reference implementation:** A working frontend is included in the `frontend/` directory. Run `just prepare` then `just frontend` to start it.
+> **Reference implementation:** A working frontend is in `frontend/`. Run `just prepare` then start both servers with `just backend` and `just frontend`.
+
+---
 
 ## Table of Contents
 
 - [Backend Overview](#backend-overview)
 - [Frontend Setup](#frontend-setup)
-- [Connecting to the Backend](#connecting-to-the-backend)
-- [Chat Agent Integration](#chat-agent-integration)
-- [Segment Agent Integration](#segment-agent-integration)
+- [Connecting to the Backend — CopilotKit Runtime](#connecting-to-the-backend--copilotkit-runtime)
+- [Chat Page — Actual Implementation](#chat-page--actual-implementation)
+- [Segment Page — Actual Implementation](#segment-page--actual-implementation)
+- [useCoAgentStateRender — Render Inside the Chat](#usecoagentstatrender--render-inside-the-chat)
+- [useCoAgent — Render Outside the Chat](#usecoagent--render-outside-the-chat)
+- [SegmentCard Component](#segmentcard-component)
 - [AG-UI Event Reference](#ag-ui-event-reference)
-- [Request Format](#request-format)
 - [Segment State Schema](#segment-state-schema)
+- [Alternative: Raw SSE Without CopilotKit](#alternative-raw-sse-without-copilotkit)
 - [Error Handling](#error-handling)
 - [CORS & Environment](#cors--environment)
 
@@ -25,13 +30,11 @@ The backend exposes two AG-UI protocol compliant endpoints:
 
 | Method | Path | Agent | Description |
 |--------|------|-------|-------------|
-| `POST` | `/api/v1/chat` | Chat Agent | General-purpose conversational agent. Streams text tokens via SSE. |
-| `POST` | `/api/v1/segment` | Segment Agent | Generates structured user segments from natural language. Emits both `STATE_SNAPSHOT` (structured data) and text messages via SSE. |
-| `GET` | `/health` | — | Health check, returns `{"status": "ok"}` |
+| `POST` | `/api/v1/chat` | Chat Agent | Streams text tokens via SSE. Maintains conversation history per `thread_id`. |
+| `POST` | `/api/v1/segment` | Segment Agent | Emits `STATE_SNAPSHOT` (structured `Segment` object) + text summary via SSE. |
+| `GET` | `/health` | — | Health check → `{"status": "ok"}` |
 
-Both agent endpoints accept an AG-UI `RunAgentInput` body and return AG-UI protocol events over Server-Sent Events (SSE).
-
-The backend runs on `http://localhost:8000` by default.
+Both endpoints accept an AG-UI `RunAgentInput` body and stream AG-UI protocol events. The backend runs on `http://localhost:8000` by default.
 
 ---
 
@@ -47,71 +50,518 @@ cd my-agui-frontend
 ### 2. Install CopilotKit
 
 ```bash
-npm install @copilotkit/react-core @copilotkit/react-ui
+npm install @copilotkit/react-core @copilotkit/react-ui @copilotkit/runtime
 ```
 
-### 3. Environment Variables
+- `@copilotkit/react-core` — hooks (`useCoAgent`, `useCoAgentStateRender`, etc.) and the `CopilotKit` provider
+- `@copilotkit/react-ui` — UI components (`CopilotSidebar`, `CopilotPopup`, `CopilotChat`)
+- `@copilotkit/runtime` — server-side `CopilotRuntime` and `LangGraphHttpAgent` (used in Next.js API routes)
 
-Create `.env.local`:
+### 3. Import CopilotKit Styles
+
+In your root layout (not in individual pages):
+
+```tsx
+// app/layout.tsx
+import "@copilotkit/react-ui/styles.css";
+```
+
+### 4. Environment Variables
+
+Create `frontend/.env.local`:
 
 ```env
 NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 ```
 
+The `NEXT_PUBLIC_` prefix makes this variable available in the browser bundle. Without it, Next.js strips it from client-side code.
+
 ---
 
-## Connecting to the Backend
+## Connecting to the Backend — CopilotKit Runtime
 
-### Option A: Using CopilotKit's Built-in Runtime
+The frontend does not call the Python backend directly. Instead:
 
-If using CopilotKit's `runtimeUrl` with a Copilot Runtime proxy, point it at your backend. CopilotKit will handle AG-UI event parsing automatically.
+1. CopilotKit components (`CopilotSidebar`, etc.) POST to a **Next.js API route** in your app
+2. That API route runs `CopilotRuntime` + `LangGraphHttpAgent` on the server
+3. `LangGraphHttpAgent` forwards the request to the Python backend and parses the AG-UI SSE stream
+4. CopilotKit translates the events and streams them back to the browser
+
+This indirection is required because CopilotKit's internal wire format is not the same as raw AG-UI — `CopilotRuntime` handles the translation.
+
+### Next.js API Route (one per agent)
+
+The actual implementation uses **separate routes per agent**, each with its own `CopilotRuntime` pointing at a different backend endpoint.
+
+**`app/api/copilotkit/chat/route.ts`**
+
+```typescript
+import {
+  CopilotRuntime,
+  EmptyAdapter,
+  copilotRuntimeNextJSAppRouterEndpoint,
+} from "@copilotkit/runtime";
+import { LangGraphHttpAgent } from "@copilotkit/runtime/langgraph";
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+const runtime = new CopilotRuntime({
+  agents: {
+    default: new LangGraphHttpAgent({
+      url: `${BACKEND_URL}/api/v1/chat`,
+      description: "General-purpose chat agent",
+    }),
+  },
+});
+
+export const POST = async (req: Request) => {
+  const { handleRequest } = copilotRuntimeNextJSAppRouterEndpoint({
+    runtime,
+    serviceAdapter: new EmptyAdapter(),
+    endpoint: "/api/copilotkit/chat",
+  });
+  return handleRequest(req);
+};
+```
+
+**`app/api/copilotkit/segment/route.ts`**
+
+```typescript
+import {
+  CopilotRuntime,
+  EmptyAdapter,
+  copilotRuntimeNextJSAppRouterEndpoint,
+} from "@copilotkit/runtime";
+import { LangGraphHttpAgent } from "@copilotkit/runtime/langgraph";
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+const runtime = new CopilotRuntime({
+  agents: {
+    default: new LangGraphHttpAgent({
+      url: `${BACKEND_URL}/api/v1/segment`,
+      description: "Segment generation agent",
+    }),
+  },
+});
+
+export const POST = async (req: Request) => {
+  const { handleRequest } = copilotRuntimeNextJSAppRouterEndpoint({
+    runtime,
+    serviceAdapter: new EmptyAdapter(),
+    endpoint: "/api/copilotkit/segment",
+  });
+  return handleRequest(req);
+};
+```
+
+**Key points:**
+- `LangGraphHttpAgent` is CopilotKit's adapter for any AG-UI-compliant endpoint (not just LangGraph)
+- `EmptyAdapter` signals that CopilotKit is not running its own LLM — the Python backend does all LLM work
+- The agent name `"default"` must match what the frontend hooks reference (`useCoAgent({ name: "default" })`)
+- `endpoint` must match the route's URL path so CopilotKit can construct internal URLs correctly
+
+---
+
+## Chat Page — Actual Implementation
+
+**`app/chat/page.tsx`**
 
 ```tsx
-// app/layout.tsx
 "use client";
 
 import { CopilotKit } from "@copilotkit/react-core";
-import "@copilotkit/react-ui/styles.css";
+import { CopilotSidebar } from "@copilotkit/react-ui";
+import { Nav } from "@/components/Nav";
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function ChatPage() {
   return (
-    <html lang="en">
-      <body>
-        <CopilotKit runtimeUrl="/api/copilotkit">
-          {children}
-        </CopilotKit>
-      </body>
-    </html>
+    <CopilotKit runtimeUrl="/api/copilotkit/chat">
+      <CopilotSidebar
+        defaultOpen={true}
+        labels={{
+          title: "Chat",
+          initial: "Hi! I'm powered by Claude, running on the AG-UI backend.\nNo AI on the frontend — ask me anything!",
+        }}
+      >
+        <div className="h-screen flex flex-col">
+          <Nav />
+          <main className="flex-1 flex items-center justify-center text-gray-400">
+            <p className="text-sm">Chat Agent — all LLM calls happen on the Python backend.</p>
+          </main>
+        </div>
+      </CopilotSidebar>
+    </CopilotKit>
   );
 }
 ```
 
-You would then need a Next.js API route that proxies to this backend.
+**What's happening:**
+- `<CopilotKit runtimeUrl="/api/copilotkit/chat">` — establishes the connection to the chat API route. All CopilotKit hooks inside this provider talk to this runtime.
+- `<CopilotSidebar>` — renders the full chat UI (message list, input, streaming text display)
+- `labels.initial` — the greeting shown before any conversation. Supports markdown.
+- No hooks needed — the chat agent only streams text, which `CopilotSidebar` handles automatically
 
-### Option B: Direct SSE Connection (Recommended for This Backend)
+---
 
-Since this backend implements the AG-UI protocol directly (not through the CopilotKit SDK), you can consume the SSE streams directly. This gives you full control and works with any AG-UI frontend framework.
+## Segment Page — Actual Implementation
+
+The segment page is more involved because the agent emits `STATE_SNAPSHOT` in addition to text. Two hooks are used to surface that state in two places simultaneously.
+
+**`app/segment/page.tsx`**
 
 ```tsx
+"use client";
+
+import { CopilotKit, useCoAgentStateRender, useCoAgent } from "@copilotkit/react-core";
+import { CopilotSidebar } from "@copilotkit/react-ui";
+import { Nav } from "@/components/Nav";
+import { SegmentCard } from "@/components/SegmentCard";
+
+interface Segment {
+  name: string;
+  description: string;
+  condition_groups: Array<{
+    logical_operator: "AND" | "OR";
+    conditions: Array<{ field: string; operator: string; value: string | number | string[] }>;
+  }>;
+  estimated_scope?: string;
+}
+
+// Inner component — hooks must run inside <CopilotKit>, which is in the outer component
+function SegmentPageContent() {
+  // Renders <SegmentCard> inline inside the chat thread when STATE_SNAPSHOT arrives
+  useCoAgentStateRender({
+    name: "default",
+    render: ({ state }) =>
+      state?.condition_groups ? <SegmentCard segment={state} /> : null,
+  });
+
+  // Reads the same STATE_SNAPSHOT into React state — drives the card outside the chat
+  const { state: segment } = useCoAgent<Segment>({ name: "default" });
+
+  return (
+    <div className="h-screen flex flex-col">
+      <Nav />
+      <main className="flex-1 flex items-center justify-center p-8">
+        {segment?.condition_groups ? (
+          <div className="w-full max-w-lg">
+            <SegmentCard segment={segment} />
+          </div>
+        ) : (
+          <p className="text-sm text-gray-400">
+            Describe your audience in the sidebar to generate a segment.
+          </p>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default function SegmentPage() {
+  return (
+    <CopilotKit runtimeUrl="/api/copilotkit/segment">
+      <CopilotSidebar
+        defaultOpen={true}
+        instructions="You are a user segmentation assistant. The user will describe a target audience and you will generate a structured segment definition with conditions. Available fields include: age, gender, country, city, signup_date, plan_type, purchase_count, total_spent, login_count, email_opened, email_clicked, app_opens, feature_used. Available operators: equals, not_equals, greater_than, less_than, contains, within_last, before, after, between, is_set, is_not_set, in, not_in."
+        labels={{
+          title: "Segment Builder",
+          initial: "Describe your target audience and I'll generate a structured segment.\n\nTry: **\"Users from the US who signed up in the last 30 days and made a purchase\"**",
+        }}
+      >
+        <SegmentPageContent />
+      </CopilotSidebar>
+    </CopilotKit>
+  );
+}
+```
+
+**Why the inner component pattern?**
+React hooks must be called inside their context provider. `useCoAgent` and `useCoAgentStateRender` read from CopilotKit's context, which is established by `<CopilotKit>`. If you called those hooks directly in `SegmentPage` (the component that renders `<CopilotKit>`), they would run before the provider mounts and throw an error. The solution: move hook calls into `SegmentPageContent`, which renders *inside* the provider.
+
+---
+
+## useCoAgentStateRender — Render Inside the Chat
+
+```typescript
+useCoAgentStateRender({
+  name: "default",
+  render: ({ state, status }) =>
+    state?.condition_groups ? <SegmentCard segment={state} /> : null,
+});
+```
+
+**What it does:** Injects a React component directly into the chat thread, in the message slot of the current agent run. The component appears where the agent's reply would be — before the text message.
+
+**`render` function parameters:**
+- `state` — the agent state from the latest `STATE_SNAPSHOT`. Will be `undefined` before the first snapshot arrives.
+- `status: "inProgress" | "complete"` — `"inProgress"` while the agent is still running (between `RUN_STARTED` and `RUN_FINISHED`), `"complete"` after the run finishes. Use this to show loading indicators or lock the card UI.
+
+**Guard `state?.condition_groups`** — CopilotKit may call `render` while state exists but is only partially populated (individual fields can be `undefined`). Always guard array fields before rendering.
+
+**Per-run scoping** — each agent run gets its own render slot. When the user sends a second message, a new slot is created. Previous turns keep their rendered cards in the chat history.
+
+**Example using `status`:**
+```tsx
+render: ({ state, status }) => {
+  if (!state?.condition_groups) return null;
+  return (
+    <>
+      <SegmentCard segment={state} />
+      {status === "inProgress" && (
+        <p className="text-xs text-gray-400 mt-1">Refining...</p>
+      )}
+    </>
+  );
+}
+```
+
+---
+
+## useCoAgent — Render Outside the Chat
+
+```typescript
+const { state: segment } = useCoAgent<Segment>({ name: "default" });
+```
+
+**What it does:** Subscribes to the agent's state as a React value. Every `STATE_SNAPSHOT` event updates `state` and triggers a re-render — exactly like `useState` but driven by the SSE stream.
+
+**Full return type:**
+```typescript
+{
+  state: Segment | undefined;              // undefined before first snapshot
+  setState: (state: Segment) => void;      // push state back to the agent
+  run: (hint?: string) => void;            // trigger a run programmatically
+  stop: () => void;                        // abort an in-progress run
+  running: boolean;                        // true while agent is executing
+}
+```
+
+**State lifetime:** Persists while `<CopilotKit>` is mounted. Navigating away unmounts the provider and resets state to `undefined` automatically — no cleanup needed.
+
+**`setState`** — bidirectional sync. The frontend can modify agent state directly (e.g., user edits a condition in the card, and the agent should be aware on the next run).
+
+**`run` / `stop` / `running`** — lets you trigger runs from code rather than the chat input, and show loading state anywhere on the page:
+```tsx
+const { run, running } = useCoAgent({ name: "default" });
+
+<button onClick={() => run("Generate a default segment")} disabled={running}>
+  {running ? "Generating..." : "Auto-Generate"}
+</button>
+```
+
+---
+
+## SegmentCard Component
+
+**`components/SegmentCard.tsx`**
+
+A pure display component — no hooks, no CopilotKit dependency. Takes a `Segment` prop and renders it as a styled card. Safe to use anywhere, including inside `useCoAgentStateRender`.
+
+```tsx
+interface Condition {
+  field: string;
+  operator: string;
+  value: string | number | string[];
+}
+
+interface ConditionGroup {
+  logical_operator: "AND" | "OR";
+  conditions: Condition[];
+}
+
+interface Segment {
+  name: string;
+  description: string;
+  condition_groups: ConditionGroup[];
+  estimated_scope?: string;
+}
+
+export function SegmentCard({ segment }: { segment: Segment }) {
+  return (
+    <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden text-sm my-2 w-full">
+      <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-semibold text-gray-900 dark:text-gray-100">
+            {segment.name}
+          </span>
+          <span className="shrink-0 text-xs bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300 px-2 py-0.5 rounded-full">
+            Segment
+          </span>
+        </div>
+        <p className="text-gray-500 dark:text-gray-400 mt-1 text-xs">
+          {segment.description}
+        </p>
+      </div>
+
+      <div className="px-4 py-3 space-y-4">
+        {(segment.condition_groups ?? []).map((group, gi) => (
+          <div key={gi}>
+            {gi > 0 && (
+              <div className="text-xs text-gray-400 font-medium text-center mb-3">
+                — OR —
+              </div>
+            )}
+            <div className="text-xs text-gray-500 dark:text-gray-400 mb-2 font-medium">
+              Group {gi + 1} &middot; {group.logical_operator}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {(group.conditions ?? []).map((cond, ci) => (
+                <span
+                  key={ci}
+                  className="inline-flex items-center gap-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 px-2 py-1 rounded-md text-xs font-mono"
+                >
+                  <span className="text-purple-600 dark:text-purple-400">{cond.field}</span>
+                  <span className="text-gray-400">{cond.operator}</span>
+                  <span>
+                    {Array.isArray(cond.value)
+                      ? cond.value.join(", ")
+                      : String(cond.value)}
+                  </span>
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {segment.estimated_scope && (
+        <div className="px-4 py-2 bg-gray-50 dark:bg-gray-800/50 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400">
+          Scope: {segment.estimated_scope}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## AG-UI Event Reference
+
+Every SSE line from the backend:
+
+```
+data: {"type": "EVENT_TYPE", "camelCaseField": "value"}\n\n
+```
+
+Top-level event fields use **camelCase** (the Python backend's snake_case is converted by the `ag-ui-protocol` encoder). However, the **`snapshot` dict content** (from `segment.model_dump()`) retains **snake_case** keys — this is what `useCoAgent` returns and what `SegmentCard` reads.
+
+### Chat Agent Event Sequence
+
+```
+data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
+data: {"type":"TEXT_MESSAGE_START","messageId":"...","role":"assistant"}
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"Hello"}
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":" there"}
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"!"}
+data: {"type":"TEXT_MESSAGE_END","messageId":"..."}
+data: {"type":"RUN_FINISHED","threadId":"...","runId":"..."}
+```
+
+### Segment Agent Event Sequence
+
+```
+data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
+data: {"type":"STEP_STARTED","stepName":"generate_segment"}
+data: {"type":"STATE_SNAPSHOT","snapshot":{"name":"Active US Buyers","description":"...","condition_groups":[{"logical_operator":"AND","conditions":[{"field":"country","operator":"equals","value":"US"}]}],"estimated_scope":"..."}}
+data: {"type":"TEXT_MESSAGE_START","messageId":"...","role":"assistant"}
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"Created segment: **Active US Buyers**\n\n..."}
+data: {"type":"TEXT_MESSAGE_END","messageId":"..."}
+data: {"type":"STEP_FINISHED","stepName":"generate_segment"}
+data: {"type":"RUN_FINISHED","threadId":"...","runId":"..."}
+```
+
+Note: `snapshot` keys are **snake_case** (`condition_groups`, not `conditionGroups`) — they come from Pydantic's `model_dump()` which preserves the Python field names.
+
+### Error Sequence
+
+```
+data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
+data: {"type":"RUN_ERROR","message":"API key not configured"}
+```
+
+On error, `RUN_FINISHED` is **not** sent. The stream closes after `RUN_ERROR`.
+
+### All Event Types
+
+| Event Type | Fields | When |
+|-----------|--------|------|
+| `RUN_STARTED` | `threadId`, `runId` | First event in every stream |
+| `RUN_FINISHED` | `threadId`, `runId` | Last event on success |
+| `RUN_ERROR` | `message`, `code?` | On failure (terminal) |
+| `STEP_STARTED` | `stepName` | Before a graph node (segment only) |
+| `STEP_FINISHED` | `stepName` | After a graph node (segment only) |
+| `TEXT_MESSAGE_START` | `messageId`, `role` | Before text tokens |
+| `TEXT_MESSAGE_CONTENT` | `messageId`, `delta` | Each text token/chunk |
+| `TEXT_MESSAGE_END` | `messageId` | After all tokens |
+| `STATE_SNAPSHOT` | `snapshot` | Structured segment data (segment only) |
+
+---
+
+## Segment State Schema
+
+The `STATE_SNAPSHOT.snapshot` object matches the backend Pydantic schema exactly, with **snake_case** keys:
+
+```typescript
+interface Segment {
+  name: string;                        // e.g., "Active US Users"
+  description: string;                 // Human-readable summary
+  condition_groups: ConditionGroup[];  // snake_case — matches model_dump() output
+  estimated_scope?: string;            // Optional, e.g., "Users matching all criteria"
+}
+
+interface ConditionGroup {
+  logical_operator: "AND" | "OR";
+  conditions: Condition[];
+}
+
+interface Condition {
+  field: string;       // e.g., "country", "age", "purchase_count"
+  operator: string;    // e.g., "equals", "greater_than", "within_last"
+  value: string | number | string[];
+}
+```
+
+### Available Fields
+
+| Category | Fields |
+|----------|--------|
+| User properties | `age`, `gender`, `country`, `city`, `language`, `signup_date`, `plan_type`, `account_status` |
+| Behavioral | `purchase_count`, `last_purchase_date`, `total_spent`, `login_count`, `last_login_date`, `page_views`, `session_duration` |
+| Engagement | `email_opened`, `email_clicked`, `push_notification_opened`, `app_opens`, `feature_used` |
+| Custom | Any snake_case property name |
+
+### Available Operators
+
+`equals`, `not_equals`, `greater_than`, `less_than`, `greater_than_or_equal`, `less_than_or_equal`, `contains`, `not_contains`, `starts_with`, `ends_with`, `within_last`, `before`, `after`, `between`, `is_set`, `is_not_set`, `in`, `not_in`
+
+---
+
+## Alternative: Raw SSE Without CopilotKit
+
+You can consume this backend directly without CopilotKit using a raw `fetch` + SSE parser. This gives full control at the cost of building your own UI.
+
+### SSE Client
+
+```typescript
 // lib/agui-client.ts
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-export interface RunAgentInput {
-  thread_id: string;
-  run_id: string;
-  messages: Array<{
-    id: string;
-    role: "user" | "assistant";
-    content: string;
-  }>;
-  tools?: Array<{ name: string; description: string; parameters?: object }>;
-  context?: Array<{ description: string; value: string }>;
-  state?: Record<string, unknown>;
-}
+export type AGUIEvent =
+  | { type: "RUN_STARTED"; threadId: string; runId: string }
+  | { type: "RUN_FINISHED"; threadId: string; runId: string }
+  | { type: "RUN_ERROR"; message: string; code?: string }
+  | { type: "STEP_STARTED"; stepName: string }
+  | { type: "STEP_FINISHED"; stepName: string }
+  | { type: "TEXT_MESSAGE_START"; messageId: string; role: string }
+  | { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string }
+  | { type: "TEXT_MESSAGE_END"; messageId: string }
+  | { type: "STATE_SNAPSHOT"; snapshot: unknown };
 
 export async function streamAgent(
   endpoint: "chat" | "segment",
-  input: RunAgentInput,
+  input: { thread_id: string; run_id: string; messages: Array<{ id: string; role: string; content: string }> },
   onEvent: (event: AGUIEvent) => void,
 ): Promise<void> {
   const response = await fetch(`${BACKEND_URL}/api/v1/${endpoint}`, {
@@ -120,9 +570,7 @@ export async function streamAgent(
     body: JSON.stringify(input),
   });
 
-  if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`Backend returned ${response.status}`);
 
   const reader = response.body?.getReader();
   if (!reader) throw new Error("No response body");
@@ -143,8 +591,7 @@ export async function streamAgent(
         const jsonStr = line.slice(6).trim();
         if (jsonStr) {
           try {
-            const event = JSON.parse(jsonStr) as AGUIEvent;
-            onEvent(event);
+            onEvent(JSON.parse(jsonStr) as AGUIEvent);
           } catch {
             // skip malformed lines
           }
@@ -153,261 +600,134 @@ export async function streamAgent(
     }
   }
 }
-
-export type AGUIEvent =
-  | { type: "RUN_STARTED"; threadId: string; runId: string }
-  | { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown }
-  | { type: "RUN_ERROR"; message: string; code?: string }
-  | { type: "STEP_STARTED"; stepName: string }
-  | { type: "STEP_FINISHED"; stepName: string }
-  | { type: "TEXT_MESSAGE_START"; messageId: string; role: string }
-  | { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string }
-  | { type: "TEXT_MESSAGE_END"; messageId: string }
-  | { type: "STATE_SNAPSHOT"; snapshot: unknown };
 ```
 
----
-
-## Chat Agent Integration
-
-The chat agent (`POST /api/v1/chat`) streams text tokens. Here's a complete React component:
+### Raw Chat Component
 
 ```tsx
-// components/ChatAgent.tsx
 "use client";
-
 import { useState, useCallback } from "react";
-import { streamAgent, RunAgentInput } from "@/lib/agui-client";
-import { v4 as uuid } from "uuid";
+import { streamAgent } from "@/lib/agui-client";
 
-interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-}
-
-export function ChatAgent() {
-  const [messages, setMessages] = useState<Message[]>([]);
+export function RawChatAgent() {
+  const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([]);
   const [input, setInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [threadId] = useState(() => uuid());
+  const [streaming, setStreaming] = useState(false);
 
-  const sendMessage = useCallback(async () => {
-    if (!input.trim() || isStreaming) return;
-
-    const userMsg: Message = { id: uuid(), role: "user", content: input };
-    setMessages((prev) => [...prev, userMsg]);
+  const send = useCallback(async () => {
+    if (!input.trim() || streaming) return;
+    const userContent = input;
+    setMessages(m => [...m, { role: "user", content: userContent }]);
     setInput("");
-    setIsStreaming(true);
+    setStreaming(true);
 
-    const assistantMsgId = uuid();
     let assistantContent = "";
+    setMessages(m => [...m, { role: "assistant", content: "" }]);
 
-    // Add empty assistant message placeholder
-    setMessages((prev) => [
-      ...prev,
-      { id: assistantMsgId, role: "assistant", content: "" },
-    ]);
+    await streamAgent("chat", {
+      thread_id: "demo",
+      run_id: crypto.randomUUID(),
+      messages: [{ id: crypto.randomUUID(), role: "user", content: userContent }],
+    }, (event) => {
+      if (event.type === "TEXT_MESSAGE_CONTENT") {
+        assistantContent += event.delta;
+        setMessages(m => [...m.slice(0, -1), { role: "assistant", content: assistantContent }]);
+      }
+    });
 
-    const agentInput: RunAgentInput = {
-      thread_id: threadId,
-      run_id: uuid(),
-      messages: [{ id: userMsg.id, role: "user", content: userMsg.content }],
-    };
-
-    try {
-      await streamAgent("chat", agentInput, (event) => {
-        if (event.type === "TEXT_MESSAGE_CONTENT") {
-          assistantContent += event.delta;
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantMsgId ? { ...m, content: assistantContent } : m,
-            ),
-          );
-        }
-        // RUN_ERROR is handled in the catch block via the stream
-        if (event.type === "RUN_ERROR") {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantMsgId
-                ? { ...m, content: `Error: ${event.message}` }
-                : m,
-            ),
-          );
-        }
-      });
-    } catch (err) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMsgId
-            ? { ...m, content: `Connection error: ${err}` }
-            : m,
-        ),
-      );
-    } finally {
-      setIsStreaming(false);
-    }
-  }, [input, isStreaming, threadId]);
+    setStreaming(false);
+  }, [input, streaming]);
 
   return (
     <div>
-      <div style={{ maxHeight: 400, overflowY: "auto", marginBottom: 16 }}>
-        {messages.map((msg) => (
-          <div key={msg.id} style={{ marginBottom: 8 }}>
-            <strong>{msg.role === "user" ? "You" : "Assistant"}:</strong>{" "}
-            {msg.content}
-          </div>
-        ))}
-      </div>
-      <input
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-        placeholder="Type a message..."
-        disabled={isStreaming}
-      />
-      <button onClick={sendMessage} disabled={isStreaming}>
-        Send
-      </button>
+      {messages.map((m, i) => (
+        <div key={i}><strong>{m.role}:</strong> {m.content}</div>
+      ))}
+      <input value={input} onChange={e => setInput(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && send()} disabled={streaming} />
+      <button onClick={send} disabled={streaming}>Send</button>
     </div>
   );
 }
 ```
 
----
-
-## Segment Agent Integration
-
-The segment agent (`POST /api/v1/segment`) returns both:
-- A `STATE_SNAPSHOT` event with the structured segment data
-- A `TEXT_MESSAGE_*` sequence with a human-readable summary
+### Raw Segment Component
 
 ```tsx
-// components/SegmentAgent.tsx
 "use client";
-
 import { useState, useCallback } from "react";
-import { streamAgent, RunAgentInput } from "@/lib/agui-client";
-import { v4 as uuid } from "uuid";
-
-// Matches the backend Pydantic schema exactly
-interface Condition {
-  field: string;
-  operator: string;
-  value: string | number | string[];
-}
-
-interface ConditionGroup {
-  logical_operator: "AND" | "OR";
-  conditions: Condition[];
-}
+import { streamAgent } from "@/lib/agui-client";
 
 interface Segment {
   name: string;
   description: string;
-  condition_groups: ConditionGroup[];
+  condition_groups: Array<{
+    logical_operator: "AND" | "OR";
+    conditions: Array<{ field: string; operator: string; value: string | number | string[] }>;
+  }>;
   estimated_scope?: string;
 }
 
-export function SegmentAgent() {
-  const [query, setQuery] = useState("");
+export function RawSegmentAgent() {
   const [segment, setSegment] = useState<Segment | null>(null);
   const [summary, setSummary] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const generateSegment = useCallback(async () => {
-    if (!query.trim() || isLoading) return;
-
-    setIsLoading(true);
+  const generate = useCallback(async () => {
+    if (!query.trim() || loading) return;
+    setLoading(true);
     setSegment(null);
     setSummary("");
     setError(null);
+    let text = "";
 
-    const input: RunAgentInput = {
-      thread_id: uuid(),
-      run_id: uuid(),
-      messages: [{ id: uuid(), role: "user", content: query }],
-    };
+    await streamAgent("segment", {
+      thread_id: crypto.randomUUID(),
+      run_id: crypto.randomUUID(),
+      messages: [{ id: crypto.randomUUID(), role: "user", content: query }],
+    }, (event) => {
+      switch (event.type) {
+        case "STATE_SNAPSHOT":
+          setSegment(event.snapshot as Segment);
+          break;
+        case "TEXT_MESSAGE_CONTENT":
+          text += event.delta;
+          setSummary(text);
+          break;
+        case "RUN_ERROR":
+          setError(event.message);
+          break;
+      }
+    }).catch(err => setError(String(err)));
 
-    let textContent = "";
-
-    try {
-      await streamAgent("segment", input, (event) => {
-        switch (event.type) {
-          case "STATE_SNAPSHOT":
-            // This contains the structured segment data
-            setSegment(event.snapshot as Segment);
-            break;
-
-          case "TEXT_MESSAGE_CONTENT":
-            // Accumulate the human-readable summary
-            textContent += event.delta;
-            setSummary(textContent);
-            break;
-
-          case "RUN_ERROR":
-            setError(event.message);
-            break;
-        }
-      });
-    } catch (err) {
-      setError(`Connection error: ${err}`);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [query, isLoading]);
+    setLoading(false);
+  }, [query, loading]);
 
   return (
     <div>
-      <h2>Segment Generator</h2>
-
-      <div style={{ marginBottom: 16 }}>
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && generateSegment()}
-          placeholder="Describe your target audience..."
-          style={{ width: 400 }}
-          disabled={isLoading}
-        />
-        <button onClick={generateSegment} disabled={isLoading}>
-          {isLoading ? "Generating..." : "Generate Segment"}
-        </button>
-      </div>
-
-      {error && <div style={{ color: "red" }}>Error: {error}</div>}
-
-      {summary && (
-        <div style={{ marginBottom: 16, fontStyle: "italic" }}>{summary}</div>
-      )}
-
+      <input value={query} onChange={e => setQuery(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && generate()} disabled={loading} />
+      <button onClick={generate} disabled={loading}>
+        {loading ? "Generating..." : "Generate"}
+      </button>
+      {error && <p style={{ color: "red" }}>{error}</p>}
+      {summary && <p>{summary}</p>}
       {segment && (
         <div>
           <h3>{segment.name}</h3>
           <p>{segment.description}</p>
-          {segment.estimated_scope && (
-            <p><em>Scope: {segment.estimated_scope}</em></p>
-          )}
-
-          {segment.condition_groups.map((group, gi) => (
-            <div key={gi} style={{ border: "1px solid #ccc", padding: 12, marginBottom: 8 }}>
-              <strong>Group ({group.logical_operator})</strong>
+          {segment.condition_groups.map((g, gi) => (
+            <div key={gi}>
+              <strong>Group ({g.logical_operator})</strong>
               <ul>
-                {group.conditions.map((cond, ci) => (
-                  <li key={ci}>
-                    <code>{cond.field}</code> {cond.operator}{" "}
-                    <code>{JSON.stringify(cond.value)}</code>
-                  </li>
+                {g.conditions.map((c, ci) => (
+                  <li key={ci}><code>{c.field}</code> {c.operator} <code>{JSON.stringify(c.value)}</code></li>
                 ))}
               </ul>
             </div>
           ))}
-
-          <details>
-            <summary>Raw JSON</summary>
-            <pre>{JSON.stringify(segment, null, 2)}</pre>
-          </details>
         </div>
       )}
     </div>
@@ -417,179 +737,27 @@ export function SegmentAgent() {
 
 ---
 
-## AG-UI Event Reference
-
-Every SSE line from the backend follows the format: `data: {"type": "EVENT_TYPE", ...}\n\n`
-
-Field names are **camelCase** in the JSON (Python snake_case is auto-converted).
-
-### Chat Agent Event Sequence
-
-```
-data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
-data: {"type":"TEXT_MESSAGE_START","messageId":"...","role":"assistant"}
-data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"Hello"}
-data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":" there"}
-data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"!"}
-data: {"type":"TEXT_MESSAGE_END","messageId":"..."}
-data: {"type":"RUN_FINISHED","threadId":"...","runId":"..."}
-```
-
-### Segment Agent Event Sequence
-
-```
-data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
-data: {"type":"STEP_STARTED","stepName":"generate_segment"}
-data: {"type":"STATE_SNAPSHOT","snapshot":{"name":"...","description":"...","conditionGroups":[...]}}
-data: {"type":"TEXT_MESSAGE_START","messageId":"...","role":"assistant"}
-data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"...","delta":"Created segment: **Active US Users**\n\n..."}
-data: {"type":"TEXT_MESSAGE_END","messageId":"..."}
-data: {"type":"STEP_FINISHED","stepName":"generate_segment"}
-data: {"type":"RUN_FINISHED","threadId":"...","runId":"..."}
-```
-
-### Error Sequence
-
-```
-data: {"type":"RUN_STARTED","threadId":"...","runId":"..."}
-data: {"type":"RUN_ERROR","message":"API key not configured"}
-```
-
-Note: on error, `RUN_FINISHED` is **not** sent — the stream ends after `RUN_ERROR`.
-
-### All Event Types Used
-
-| Event Type | Fields | When |
-|-----------|--------|------|
-| `RUN_STARTED` | `threadId`, `runId` | First event in every stream |
-| `RUN_FINISHED` | `threadId`, `runId`, `result?` | Last event on success |
-| `RUN_ERROR` | `message`, `code?` | On failure (terminal) |
-| `STEP_STARTED` | `stepName` | Before a graph step (segment only) |
-| `STEP_FINISHED` | `stepName` | After a graph step (segment only) |
-| `TEXT_MESSAGE_START` | `messageId`, `role` | Before text tokens |
-| `TEXT_MESSAGE_CONTENT` | `messageId`, `delta` | Each text token/chunk |
-| `TEXT_MESSAGE_END` | `messageId` | After all tokens |
-| `STATE_SNAPSHOT` | `snapshot` | Structured data (segment only) |
-
----
-
-## Request Format
-
-Both endpoints accept the same AG-UI `RunAgentInput` shape:
-
-```typescript
-interface RunAgentInput {
-  thread_id: string;       // Conversation identifier (for continuity)
-  run_id: string;          // Unique per request
-  messages: Message[];     // Conversation history
-  tools?: Tool[];          // Available tools (optional, not used currently)
-  context?: Context[];     // Background context (optional)
-  state?: object;          // Agent state (optional)
-  forwarded_props?: object; // Custom config (optional)
-}
-
-interface Message {
-  id: string;
-  role: "user" | "assistant" | "system" | "tool";
-  content: string | InputContent[];
-}
-
-// For multimodal content
-interface InputContent {
-  type: "text" | "binary";
-  text?: string;         // for type="text"
-  mime_type?: string;    // for type="binary"
-  data?: string;         // base64 for type="binary"
-}
-```
-
-**Minimal request example:**
-
-```json
-{
-  "thread_id": "abc-123",
-  "run_id": "run-456",
-  "messages": [
-    { "id": "msg-1", "role": "user", "content": "Active users from the US" }
-  ]
-}
-```
-
-The backend extracts the **last user message** from the `messages` array as the query. All other fields are optional.
-
----
-
-## Segment State Schema
-
-The `STATE_SNAPSHOT` event from the segment agent contains this structure:
-
-```typescript
-interface Segment {
-  name: string;                        // e.g., "Active US Users"
-  description: string;                 // Human-readable summary
-  condition_groups: ConditionGroup[];
-  estimated_scope?: string;            // e.g., "Users matching all criteria"
-}
-
-interface ConditionGroup {
-  logical_operator: "AND" | "OR";
-  conditions: Condition[];
-}
-
-interface Condition {
-  field: string;       // e.g., "country", "age", "purchase_count"
-  operator: string;    // e.g., "equals", "greater_than", "within_last"
-  value: string | number | string[];
-}
-```
-
-### Available Fields
-
-| Category | Fields |
-|----------|--------|
-| User properties | `age`, `gender`, `country`, `city`, `language`, `signup_date`, `plan_type`, `account_status` |
-| Behavioral events | `purchase_count`, `last_purchase_date`, `total_spent`, `login_count`, `last_login_date`, `page_views`, `session_duration` |
-| Engagement | `email_opened`, `email_clicked`, `push_notification_opened`, `app_opens`, `feature_used` |
-| Custom | Any snake_case property name |
-
-### Available Operators
-
-`equals`, `not_equals`, `greater_than`, `less_than`, `greater_than_or_equal`, `less_than_or_equal`, `contains`, `not_contains`, `starts_with`, `ends_with`, `within_last`, `before`, `after`, `between`, `is_set`, `is_not_set`, `in`, `not_in`
-
----
-
 ## Error Handling
 
 ### Backend Errors
 
-When the backend encounters an error, it sends a `RUN_ERROR` event and closes the stream:
+When the backend encounters an error, it sends `RUN_ERROR` and closes the stream:
 
 ```json
-{"type": "RUN_ERROR", "message": "Anthropic API key not set"}
+{ "type": "RUN_ERROR", "message": "Anthropic API key not set" }
 ```
 
-Check for this event type and display the `message` field to the user.
+With CopilotKit, errors are shown automatically in the sidebar. With raw SSE, handle the event explicitly.
 
 ### Connection Errors
 
-If `fetch()` fails (backend down, network issue), handle it in the `catch` block:
+If the backend is unreachable, `fetch()` will throw. Wrap your call in `try/catch`.
 
-```typescript
-try {
-  await streamAgent("chat", input, onEvent);
-} catch (err) {
-  // Backend is unreachable
-  showError(`Cannot connect to backend: ${err}`);
-}
-```
-
-### Missing API Key
-
-The backend requires `ANTHROPIC_API_KEY` to be set. If missing, agents will fail at startup and the server won't start. Verify with:
+### Verifying Backend Health
 
 ```bash
 curl http://localhost:8000/health
-# Should return: {"status": "ok"}
+# Expected: {"status":"ok"}
 ```
 
 ---
@@ -598,11 +766,11 @@ curl http://localhost:8000/health
 
 ### Development
 
-The backend allows all origins (`Access-Control-Allow-Origin: *`) with `allow_credentials=False`. No special CORS configuration is needed on the frontend during development.
+The backend allows all origins (`Access-Control-Allow-Origin: *`) with `allow_credentials=False`. No frontend CORS config needed.
 
 ### Production
 
-For production, update the backend's CORS config in `main.py` to restrict origins:
+Update `main.py` to restrict origins:
 
 ```python
 app.add_middleware(
@@ -614,10 +782,10 @@ app.add_middleware(
 )
 ```
 
-### Backend Default Port
-
-The backend runs on **port 8000**. To change it, modify `main.py` or run:
+### Changing the Backend Port
 
 ```bash
 uv run uvicorn agui_backend_demo.main:app --host 0.0.0.0 --port 3001
 ```
+
+Update `NEXT_PUBLIC_BACKEND_URL` in `.env.local` to match.

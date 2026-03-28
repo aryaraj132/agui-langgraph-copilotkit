@@ -63,8 +63,8 @@ async def handle_template(request: Request):
     template_graph = request.app.state.template_graph
 
     thread = thread_store.get_or_create_thread(thread_id, "template")
-    prior_messages = list(thread["messages"])
     thread_store.add_message(thread_id, {"role": "user", "content": query})
+    snapshot_messages = list(thread["messages"])
 
     existing_template = frontend_state or thread["state"].get("template")
 
@@ -75,8 +75,8 @@ async def handle_template(request: Request):
 
         yield emitter.emit_run_started(thread_id, run_id)
 
-        if prior_messages:
-            yield emitter.emit_messages_snapshot(prior_messages)
+        if len(snapshot_messages) > 1:
+            yield emitter.emit_messages_snapshot(snapshot_messages)
 
         yield emitter.emit_step_start("template_processing")
 
@@ -130,14 +130,22 @@ async def handle_template(request: Request):
                                 accumulated_json += args
                                 chunk_count += 1
 
-                                # Try parsing partial JSON every few chunks
+                                # Try parsing partial JSON every few chunks.
+                                # Emit STATE_DELTA (JSON Patch) for new fields
+                                # so the frontend merges them into existing
+                                # state instead of replacing it.
                                 if chunk_count % 5 == 0:
                                     partial = _try_parse_partial_json(accumulated_json)
                                     if partial:
                                         new_keys = set(partial.keys())
                                         newly_added = new_keys - last_emitted_keys
                                         if newly_added:
-                                            yield emitter.emit_state_snapshot(partial)
+                                            # Build JSON Patch ops for new/changed fields
+                                            delta = []
+                                            for key in newly_added:
+                                                op = "add" if key not in last_emitted_keys else "replace"
+                                                delta.append({"op": op, "path": f"/{key}", "value": partial[key]})
+                                            yield emitter.emit_state_delta(delta)
 
                                             # Update activity based on newly appeared fields
                                             if "subject" in newly_added:

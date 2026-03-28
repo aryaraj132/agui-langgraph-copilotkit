@@ -23,11 +23,11 @@ export function useAgentThread() {
   useEffect(() => {
     if (threadId !== mountedThreadId) {
       setReady(false);
-      const timer = requestAnimationFrame(() => {
+      const timer = setTimeout(() => {
         setMountedThreadId(threadId);
         setReady(true);
-      });
-      return () => cancelAnimationFrame(timer);
+      }, 150);
+      return () => clearTimeout(timer);
     }
   }, [threadId, mountedThreadId]);
 

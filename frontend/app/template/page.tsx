@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect } from "react";
+import { Suspense, useEffect, useRef } from "react";
 import {
   CopilotKit,
   useCoAgentStateRender,
@@ -24,6 +24,7 @@ import type { EmailTemplate } from "@/lib/types";
 
 function CustomRenderMessage({
   message,
+  messages,
   inProgress,
   index,
   isCurrentMessage,
@@ -31,11 +32,19 @@ function CustomRenderMessage({
   UserMessage = DefaultUserMessage,
   ImageRenderer = DefaultImageRenderer,
 }: RenderMessageProps) {
-  if (message.role === "reasoning") {
-    return <ReasoningPanel reasoning={message.content} defaultOpen />;
-  }
+  if (message.role === "reasoning" || message.role === "activity") {
+    // Hide when no run is active
+    if (!inProgress) return null;
+    // Hide if this belongs to a completed turn (an assistant message with
+    // content exists after it in the list)
+    const fromOldTurn = messages
+      .slice(index + 1)
+      .some((m) => m.role === "assistant" && m.content);
+    if (fromOldTurn) return null;
 
-  if (message.role === "activity") {
+    if (message.role === "reasoning") {
+      return <ReasoningPanel reasoning={message.content} defaultOpen />;
+    }
     return (
       <ActivityIndicator
         activityType={(message as any).activityType ?? "processing"}
@@ -78,15 +87,18 @@ function TemplatePageContent({ threadId, isExistingThread }: { threadId: string;
   const { state: template, setState: setTemplate } =
     useCoAgent<EmailTemplate>({ name: "default" });
 
+  const setTemplateRef = useRef(setTemplate);
+  setTemplateRef.current = setTemplate;
+
   const { threadData } = useRestoreThread(threadId, isExistingThread);
 
   // Restore agent state — template is stored nested under "template" key
   useEffect(() => {
     const saved = threadData?.state?.template;
     if (saved && typeof saved === "object" && (saved as Record<string, unknown>).subject) {
-      setTemplate(saved as unknown as EmailTemplate);
+      setTemplateRef.current(saved as unknown as EmailTemplate);
     }
-  }, [threadData, setTemplate]);
+  }, [threadData]);
 
   return (
     <div className="h-screen flex flex-col">

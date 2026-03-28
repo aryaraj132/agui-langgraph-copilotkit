@@ -16,11 +16,7 @@ export function TemplatePreview({
   onHtmlChange,
 }: TemplatePreviewProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  // Tracks the last html emitted by user edits inside the iframe.
-  // When the parent feeds this value back as the `html` prop we skip
-  // the expensive doc.write() rewrite so the cursor stays in place.
   const userEditHtml = useRef<string | null>(null);
-  // Stable ref so the input handler never goes stale.
   const onHtmlChangeRef = useRef(onHtmlChange);
   onHtmlChangeRef.current = onHtmlChange;
 
@@ -36,10 +32,10 @@ export function TemplatePreview({
     }
     userEditHtml.current = null;
 
-    // Full rewrite — necessary for initial render and agent updates
+    // Full rewrite
     doc.open();
     doc.write(
-      `<!DOCTYPE html><html><head><style>${css}</style></head>` +
+      `<!DOCTYPE html><html><head><style>${css || ""}</style></head>` +
         `<body style="margin:0;padding:20px;background:#f5f5f5;">` +
         `${html || '<p style="text-align:center;color:#999;padding:40px;">Preview will appear here</p>'}` +
         `</body></html>`,
@@ -48,7 +44,6 @@ export function TemplatePreview({
 
     if (editable) {
       doc.designMode = "on";
-      // Re-attach listener — doc.open() destroys all previous listeners
       doc.addEventListener("input", () => {
         if (!doc.body) return;
         const newHtml = doc.body.innerHTML;

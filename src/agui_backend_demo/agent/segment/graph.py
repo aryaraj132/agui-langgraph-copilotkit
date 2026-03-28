@@ -2,7 +2,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from agui_backend_demo.agent.state import SegmentAgentState
+from agui_backend_demo.agent.segment.state import SegmentAgentState
 from agui_backend_demo.schemas.segment import Segment
 
 SYSTEM_PROMPT = """\

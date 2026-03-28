@@ -5,7 +5,10 @@ import { usePathname } from "next/navigation";
 
 const links = [
   { href: "/chat", label: "Chat" },
-  { href: "/segment", label: "Segment Builder" },
+  { href: "/segment", label: "Segment" },
+  { href: "/template", label: "Template" },
+  { href: "/campaign", label: "Campaign" },
+  { href: "/custom-property", label: "Properties" },
 ];
 
 export function Nav() {
@@ -21,7 +24,7 @@ export function Nav() {
           <Link
             key={href}
             href={href}
-            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+            className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
               pathname === href
                 ? "bg-white dark:bg-gray-700 shadow-sm"
                 : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"

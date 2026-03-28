@@ -223,6 +223,7 @@ just prepare      # Install all deps (backend + frontend)
 - [CopilotKit](https://docs.copilotkit.ai) — AG-UI hooks and chat UI components
 - [Next.js 15](https://nextjs.org/) — React framework with App Router
 - [Tailwind CSS v4](https://tailwindcss.com/) — utility-first styling
+- [Playground](https://feature-viewer.copilotkit.ai/langgraph/feature/agentic_chat?file=page.tsx)
 
 ---
 
